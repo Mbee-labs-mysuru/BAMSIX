@@ -19,6 +19,10 @@ namespace bamsix {
 /// child based on the corresponding bit of the value.
 class SARange {
 public:
+    /// Rank checkpoint sampling interval (bits per block).
+    /// Rank0 scans at most RANK_SAMPLE_BITS/8 = 64 bytes per query → O(1).
+    static constexpr uint64_t RANK_SAMPLE_BITS = 512;
+
     /// Build wavelet tree over the given SA samples.
     /// max_val should be the maximum possible SA value (typically |S|).
     /// quantize_step divides values to reduce tree depth: O(log(max_val/quantize_step)).

@@ -141,7 +141,7 @@ void BuildIndex(const std::vector<std::string>& bam_paths,
     // Populate header
     BsiHeader header;
     std::memcpy(header.magic, "BMSI", 4);
-    header.version = 6;
+    header.version = BAMSIX_FORMAT_VERSION;
     std::strncpy(header.bamsix_version, BAMSIX_VERSION, 15);
 
     // Provenance fields per Contract §9.2

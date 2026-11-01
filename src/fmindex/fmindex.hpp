@@ -5,25 +5,43 @@
 #include <cstdint>
 #include <vector>
 
+// sdsl-lite wavelet tree (Architecture §4.6: "wavelet tree or RRR bitvectors")
+// NOTE: Include wt_huff.hpp directly, NOT wavelet_trees.hpp which pulls in
+// construct_sa.hpp -> divsufsort.h (unnecessary transitive dependency).
+#include <sdsl/wt_huff.hpp>
+
 namespace bamsix {
 
-/// Occ table for FM-index — checkpointed rank over the full BWT.
+/// Occ table for FM-index — wavelet-tree rank over the full BWT.
 /// Provides RankBwt(a, pos): half-open count of symbol a in BWT[0..pos)
 /// Used ONLY by the FM backward search and LF-mapping (Invariant I15).
+///
+/// Implementation: sdsl::wt_huff<> (Huffman-shaped wavelet tree).
+/// Space: n·H₀ + 2|Σ|·log(n) bits  (Architecture §9.4).
+/// Rank:  O(log σ) time per query    (Architecture §4.6).
+///
+/// v1.1 change: Replaces v1.0's block-checkpointed linear scan
+/// (O(BLOCK_SIZE) rank, 8 bits/char BWT storage) with sdsl wavelet tree
+/// (O(log σ) rank, H₀ bits/char BWT storage).
 class OccTable {
 public:
-    static constexpr uint64_t BLOCK_SIZE = 64;
-
     void Build(const std::vector<uint8_t>& bwt, uint8_t sigma);
     uint64_t RankBwt(uint8_t a, uint64_t pos) const;
+
+    /// Access BWT character at position i via wavelet tree.
+    /// O(log σ) time. Used by LF-mapping when FMIndexEngine
+    /// delegates to the wavelet tree instead of raw bwt_.
+    uint8_t BwtAt(uint64_t pos) const;
+
+    uint64_t BwtLen() const { return bwt_len_; }
+
     std::vector<uint8_t> Serialize() const;
     void Deserialize(const uint8_t* data, size_t len);
 
 private:
     uint8_t sigma_ = 0;
     uint64_t bwt_len_ = 0;
-    std::vector<uint8_t> bwt_;
-    std::vector<uint64_t> occ_;
+    sdsl::wt_huff<> wt_;  // Huffman-shaped wavelet tree over BWT
 };
 
 /// FM-Index engine implementing Architecture §4.6.
@@ -63,7 +81,9 @@ public:
     const std::vector<uint64_t>& ISASamples() const { return isa_samples_; }
     uint64_t ISAStep() const { return isa_step_; }
 
-    uint8_t BwtAt(uint64_t row) const { return bwt_[row]; }
+    /// Access BWT character at given row. v1.1: delegates to wavelet tree
+    /// inside OccTable (no separate raw BWT copy — Architecture §4.5 shared_bwt).
+    uint8_t BwtAt(uint64_t row) const { return occ_.BwtAt(row); }
     uint64_t SentinelRow() const { return sentinel_row_; }
     uint64_t SampleStep() const { return sample_step_; }
     uint64_t SLen() const { return s_len_; }
@@ -84,7 +104,7 @@ public:
                         uint64_t s_len);
 
 private:
-    std::vector<uint8_t> bwt_;  // Full BWT, length |S|+1
+    // v1.1: No bwt_ member — BWT lives inside occ_ (wavelet tree).
     uint64_t bwt_len_ = 0;
     uint64_t sentinel_row_ = 0;
     uint64_t sample_step_ = 64;
@@ -116,10 +136,9 @@ public:
     SAInterval BackwardSearch(const std::vector<uint8_t>& pattern) const;
     uint64_t Locate(uint64_t row) const;
 
-    bool IsBuilt() const { return !bwt_.empty(); }
+    bool IsBuilt() const { return bwt_len_ > 0; }
 
     // Serialization
-    const std::vector<uint8_t>& BWT() const { return bwt_; }
     const std::array<uint64_t, 7>& CArray() const { return C_; }
     const OccTable& Occ() const { return occ_; }
     const std::vector<uint64_t>& SASamples() const { return sa_samples_; }
@@ -134,7 +153,7 @@ public:
                         uint64_t s_len);
 
 private:
-    std::vector<uint8_t> bwt_;
+    // v1.1: No bwt_ member — BWT lives inside occ_ (wavelet tree).
     uint64_t bwt_len_ = 0;
     uint64_t sentinel_row_ = 0;
     uint64_t sample_step_ = 64;

@@ -14,14 +14,23 @@ bool SARange::GetBit(const Level& level, uint64_t pos) const {
 
 uint64_t SARange::Rank0(const Level& level, uint64_t pos) const {
     // Count 0-bits in [0, pos)
-    uint64_t count = 0;
-    uint64_t full_bytes = pos / 8;
-    for (uint64_t b = 0; b < full_bytes; ++b) {
+    // v1.1: O(1) via rank0 checkpoints + local scan within last block.
+    if (pos == 0) return 0;
+
+    uint64_t block = pos / RANK_SAMPLE_BITS;
+    uint64_t block_start_bit = block * RANK_SAMPLE_BITS;
+    uint64_t count = (block < level.rank0.size()) ? level.rank0[block] : 0;
+
+    // Scan remaining bytes from block_start to pos
+    uint64_t byte_start = block_start_bit / 8;
+    uint64_t byte_end = pos / 8;
+    for (uint64_t b = byte_start; b < byte_end && b < level.bits.size(); ++b) {
         count += 8 - __builtin_popcount(level.bits[b]);
     }
+    // Remaining bits in the last partial byte
     uint64_t rem = pos % 8;
-    if (rem > 0 && full_bytes < level.bits.size()) {
-        uint8_t byte = level.bits[full_bytes];
+    if (rem > 0 && byte_end < level.bits.size()) {
+        uint8_t byte = level.bits[byte_end];
         for (uint64_t bit = 0; bit < rem; ++bit) {
             if (!((byte >> bit) & 1)) ++count;
         }
@@ -79,6 +88,22 @@ void SARange::Build(const std::vector<uint64_t>& sa_samples, uint64_t max_val,
             } else {
                 levels_[lev].n_zeros++;
                 left_buf.push_back(current[i]);
+            }
+        }
+
+        // v1.1: Build rank0 checkpoints for O(1) Rank0 queries.
+        // Sample every RANK_SAMPLE_BITS (512 bits = 64 bytes).
+        uint64_t n_blocks = (n_ + RANK_SAMPLE_BITS - 1) / RANK_SAMPLE_BITS + 1;
+        levels_[lev].rank0.resize(n_blocks, 0);
+        uint64_t running_zeros = 0;
+        for (uint64_t b = 0; b < n_blocks; ++b) {
+            levels_[lev].rank0[b] = running_zeros;
+            // Count zeros in this block's bytes
+            uint64_t byte_start = (b * RANK_SAMPLE_BITS) / 8;
+            uint64_t byte_end = std::min(byte_start + RANK_SAMPLE_BITS / 8,
+                                         (uint64_t)levels_[lev].bits.size());
+            for (uint64_t j = byte_start; j < byte_end; ++j) {
+                running_zeros += 8 - __builtin_popcount(levels_[lev].bits[j]);
             }
         }
 
@@ -209,6 +234,20 @@ void SARange::Deserialize(const uint8_t* data, size_t len) {
             std::memcpy(levels_[lev].bits.data(), data + off, bits_size);
         }
         off += bits_size;
+
+        // v1.1: Rebuild rank0 checkpoints from deserialized bitvector
+        uint64_t n_blocks = (n_ + RANK_SAMPLE_BITS - 1) / RANK_SAMPLE_BITS + 1;
+        levels_[lev].rank0.resize(n_blocks, 0);
+        uint64_t running_zeros = 0;
+        for (uint64_t b = 0; b < n_blocks; ++b) {
+            levels_[lev].rank0[b] = running_zeros;
+            uint64_t byte_start = (b * RANK_SAMPLE_BITS) / 8;
+            uint64_t byte_end = std::min(byte_start + RANK_SAMPLE_BITS / 8,
+                                         (uint64_t)levels_[lev].bits.size());
+            for (uint64_t j = byte_start; j < byte_end; ++j) {
+                running_zeros += 8 - __builtin_popcount(levels_[lev].bits[j]);
+            }
+        }
     }
 }
 

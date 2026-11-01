@@ -250,7 +250,7 @@ struct ChromEntry {
 struct BsiHeader {
     // Magic
     char     magic[4]       = {'B','S','I','X'};
-    uint16_t version        = 6;
+    uint16_t version        = 7;  // v7: wavelet tree Occ format
 
     // Build provenance
     char     bamsix_version[16] = {};
