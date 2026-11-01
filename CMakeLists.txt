@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(bamsix VERSION 1.0.0 LANGUAGES C CXX)
 
 set(BAMSIX_VERSION "1.0.0")
-set(BAMSIX_FORMAT_VERSION 6)
+set(BAMSIX_FORMAT_VERSION 7)  # v7: OccTable uses sdsl wavelet tree serialization
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/bamsix/config.hpp.in

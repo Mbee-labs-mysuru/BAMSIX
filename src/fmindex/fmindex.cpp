@@ -2,59 +2,79 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
+
+// sdsl serialization and RAM file system — for wavelet tree construction.
+// NOTE: Do NOT include <sdsl/construct.hpp> — it pulls in construct_sa.hpp
+// which requires divsufsort.h (an unnecessary transitive dependency for
+// wavelet tree construction).
+#include <sdsl/int_vector_buffer.hpp>
 
 namespace bamsix {
 
-// ─── OccTable ────────────────────────────────────────────────────────────────
+// ─── OccTable (sdsl wavelet tree — Architecture §4.6) ────────────────────────
 
 void OccTable::Build(const std::vector<uint8_t>& bwt, uint8_t sigma) {
     sigma_ = sigma;
-    bwt_ = bwt;
     bwt_len_ = bwt.size();
 
-    uint64_t n_blocks = (bwt_len_ / BLOCK_SIZE) + 1;
-    occ_.resize(n_blocks * sigma, 0);
+    // Construct sdsl wavelet tree from BWT byte sequence.
+    // Step 1: Write BWT to sdsl int_vector<8> and store to RAM file.
+    // Step 2: Open as int_vector_buffer<8>.
+    // Step 3: Construct wt_huff directly from buffer (no construct_im needed).
+    std::string tmp_file = sdsl::ram_file_name(
+        "bamsix_bwt_" + sdsl::util::to_string(sdsl::util::pid()) +
+        "_" + sdsl::util::to_string(sdsl::util::id()));
 
-    std::vector<uint64_t> running(sigma, 0);
-    for (uint64_t i = 0; i < bwt_len_; ++i) {
-        if (i % BLOCK_SIZE == 0) {
-            uint64_t block = i / BLOCK_SIZE;
-            for (uint8_t a = 0; a < sigma; ++a) {
-                occ_[block * sigma + a] = running[a];
-            }
+    {
+        sdsl::int_vector<8> bwt_iv(bwt.size());
+        for (size_t i = 0; i < bwt.size(); ++i) {
+            bwt_iv[i] = bwt[i];
         }
-        if (bwt[i] < sigma) {
-            running[bwt[i]]++;
-        }
+        sdsl::store_to_file(bwt_iv, tmp_file);
     }
+
+    {
+        sdsl::int_vector_buffer<8> buf(tmp_file);
+        sdsl::wt_huff<> tmp(buf, buf.size());
+        wt_.swap(tmp);
+    }
+
+    sdsl::ram_fs::remove(tmp_file);
 }
 
 uint64_t OccTable::RankBwt(uint8_t a, uint64_t pos) const {
+    // Half-open semantics: count of symbol a in BWT[0..pos)
+    // sdsl::wt_huff::rank(i, c) returns count of c in [0..i), which is
+    // exactly the half-open convention required by FM backward search.
     if (pos == 0) return 0;
     if (a >= sigma_) return 0;
     if (pos > bwt_len_) pos = bwt_len_;
+    return wt_.rank(pos, a);
+}
 
-    uint64_t block = (pos - 1) / BLOCK_SIZE;
-    uint64_t block_start = block * BLOCK_SIZE;
-    uint64_t count = occ_[block * sigma_ + a];
-
-    for (uint64_t i = block_start; i < pos && i < bwt_len_; ++i) {
-        if (bwt_[i] == a) ++count;
-    }
-    return count;
+uint8_t OccTable::BwtAt(uint64_t pos) const {
+    return static_cast<uint8_t>(wt_[pos]);
 }
 
 std::vector<uint8_t> OccTable::Serialize() const {
+    // Serialize: [sigma (1B)] [bwt_len (8B)] [sdsl_blob_size (8B)] [sdsl_blob]
+    // The sdsl blob is the native serialization of wt_huff.
+    std::stringstream ss;
+    wt_.serialize(ss);
+    std::string sdsl_data = ss.str();
+
     std::vector<uint8_t> out;
-    out.resize(sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint64_t) +
-               occ_.size() * sizeof(uint64_t));
+    size_t total = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint64_t) +
+                   sdsl_data.size();
+    out.resize(total);
     size_t off = 0;
     std::memcpy(out.data() + off, &sigma_, sizeof(sigma_)); off += sizeof(sigma_);
     std::memcpy(out.data() + off, &bwt_len_, sizeof(bwt_len_)); off += sizeof(bwt_len_);
-    uint64_t bs = BLOCK_SIZE;
-    std::memcpy(out.data() + off, &bs, sizeof(bs)); off += sizeof(bs);
-    std::memcpy(out.data() + off, occ_.data(), occ_.size() * sizeof(uint64_t));
+    uint64_t blob_size = sdsl_data.size();
+    std::memcpy(out.data() + off, &blob_size, sizeof(blob_size)); off += sizeof(blob_size);
+    std::memcpy(out.data() + off, sdsl_data.data(), sdsl_data.size());
     return out;
 }
 
@@ -62,11 +82,13 @@ void OccTable::Deserialize(const uint8_t* data, size_t len) {
     size_t off = 0;
     std::memcpy(&sigma_, data + off, sizeof(sigma_)); off += sizeof(sigma_);
     std::memcpy(&bwt_len_, data + off, sizeof(bwt_len_)); off += sizeof(bwt_len_);
-    uint64_t bs;
-    std::memcpy(&bs, data + off, sizeof(bs)); off += sizeof(bs);
-    size_t n_entries = (len - off) / sizeof(uint64_t);
-    occ_.resize(n_entries);
-    std::memcpy(occ_.data(), data + off, n_entries * sizeof(uint64_t));
+    uint64_t blob_size;
+    std::memcpy(&blob_size, data + off, sizeof(blob_size)); off += sizeof(blob_size);
+
+    // Load sdsl wavelet tree from serialized blob
+    std::string blob(reinterpret_cast<const char*>(data + off), blob_size);
+    std::istringstream ss(blob);
+    wt_.load(ss);
 }
 
 // ─── FMIndexEngine ───────────────────────────────────────────────────────────
@@ -76,7 +98,8 @@ void FMIndexEngine::Build(const std::vector<uint8_t>& bwt,
                           uint64_t sentinel,
                           uint64_t sample_s,
                           uint64_t s_len) {
-    bwt_ = bwt;
+    // v1.1: BWT is NOT stored as a separate member.
+    // It lives inside the wavelet tree (occ_) only.
     bwt_len_ = bwt.size();  // |S|+1
     sentinel_row_ = sentinel;
     sample_step_ = sample_s;
@@ -99,7 +122,7 @@ void FMIndexEngine::Build(const std::vector<uint8_t>& bwt,
     
     std::array<uint64_t, 7> sym_counts = {};  // indexed by stored code
     for (uint64_t i = 0; i < bwt_len_; ++i) {
-        if (bwt_[i] < SIGMA_EXT) sym_counts[bwt_[i]]++;
+        if (bwt[i] < SIGMA_EXT) sym_counts[bwt[i]]++;
     }
     // sym_counts[c] = total occurrences of stored code c in BWT
     // This also equals the count of stored code c as starting chars of suffixes
@@ -125,8 +148,8 @@ void FMIndexEngine::Build(const std::vector<uint8_t>& bwt,
     //               C_[1 (C)]    = 1 + sym_counts[A]
     //               etc.
 
-    // Build Occ table over full BWT (stored codes 0..6)
-    occ_.Build(bwt_, SIGMA_EXT);
+    // Build Occ wavelet tree over full BWT (stored codes 0..6)
+    occ_.Build(bwt, SIGMA_EXT);
 
     // Row-based SA sampling (Architecture §4.6):
     // sa_samples_[k] = SA[k * s]  for k = 0, 1, ..., floor(|S|/s)
@@ -168,7 +191,7 @@ SAInterval FMIndexEngine::BackwardSearch(const std::vector<uint8_t>& pattern) co
 }
 
 uint64_t FMIndexEngine::LF(uint64_t row) const {
-    uint8_t c = bwt_[row];
+    uint8_t c = occ_.BwtAt(row);  // v1.1: access BWT via wavelet tree
     return C_[c] + occ_.RankBwt(c, row);
 }
 
@@ -200,11 +223,12 @@ uint64_t FMIndexEngine::Locate(uint64_t row) const {
 }
 
 std::vector<uint8_t> FMIndexEngine::SerializeBWT() const {
+    // v1.1: read BWT characters from wavelet tree (no raw bwt_ member)
     std::vector<uint8_t> out;
     out.reserve(s_len_);
     for (uint64_t i = 0; i < bwt_len_; ++i) {
         if (i != sentinel_row_) {
-            out.push_back(bwt_[i]);
+            out.push_back(occ_.BwtAt(i));
         }
     }
     return out;
@@ -217,7 +241,7 @@ void FMIndexEngine::LoadFromStored(const std::vector<uint8_t>& full_bwt,
                                     uint64_t sentinel_row,
                                     uint64_t sample_step,
                                     uint64_t s_len) {
-    bwt_ = full_bwt;
+    // v1.1: BWT not stored separately; lives in the wavelet tree.
     bwt_len_ = full_bwt.size();
     sentinel_row_ = sentinel_row;
     sample_step_ = sample_step;
@@ -225,10 +249,17 @@ void FMIndexEngine::LoadFromStored(const std::vector<uint8_t>& full_bwt,
     C_ = c_array;
     sa_samples_ = sa_samples;
 
-    // Rebuild Occ table from the full BWT (don't use stored occ_data
-    // since it's tied to the build-time BWT which excluded sentinel).
-    // The full BWT includes sentinel, so we rebuild from scratch.
-    occ_.Build(bwt_, SIGMA_EXT);
+    // Deserialize wavelet tree from stored Occ section data.
+    // If occ_data is the sdsl format (v7+), deserialize directly.
+    // Otherwise rebuild from full_bwt (backward compat for v6 files).
+    if (!occ_data.empty()) {
+        occ_.Deserialize(occ_data.data(), occ_data.size());
+    }
+    // Verify wavelet tree length matches BWT length
+    if (occ_.BwtLen() != bwt_len_) {
+        // Fallback: rebuild from full_bwt (e.g., old format)
+        occ_.Build(full_bwt, SIGMA_EXT);
+    }
 }
 
 void FMIndexEngine::SetISASamples(std::vector<uint64_t> isa_samples, uint64_t isa_step) {
@@ -358,17 +389,18 @@ void ReverseFMIndex::Build(const std::vector<int64_t>& forward_sa,
 
     // ─── Step 4: Derive BWT_R from SA_R and S_R ─────────────────────────────
     // BWT_R[i] = S_R$[(SA_R[i] - 1 + n+1) mod (n+1)]
-    bwt_.resize(static_cast<size_t>(sa_len));
+    // v1.1: construct into local vector, then move to wavelet tree
+    std::vector<uint8_t> bwt_r(static_cast<size_t>(sa_len));
     for (int64_t i = 0; i < sa_len; ++i) {
         int64_t sa_val = sa_r[i];
         if (sa_val == 0) {
             // BWT_R[i] = S_R$[(0-1+n+1) mod (n+1)] = S_R$[n] = $ (sentinel)
-            bwt_[i] = CODE_SENT;
+            bwt_r[i] = CODE_SENT;
         } else if (sa_val == n) {
             // Sentinel position: BWT_R[sentinel_row] = S_R[n-1]
-            bwt_[i] = S_R[n - 1];
+            bwt_r[i] = S_R[n - 1];
         } else {
-            bwt_[i] = S_R[sa_val - 1];
+            bwt_r[i] = S_R[sa_val - 1];
         }
     }
 
@@ -388,8 +420,8 @@ void ReverseFMIndex::Build(const std::vector<int64_t>& forward_sa,
         cumul += freq[c];
     }
 
-    // ─── Step 6: Build Occ table ─────────────────────────────────────────────
-    occ_.Build(bwt_, SIGMA_EXT);
+    // ─── Step 6: Build Occ wavelet tree ──────────────────────────────────────
+    occ_.Build(bwt_r, SIGMA_EXT);
 
     // ─── Step 7: SA samples ──────────────────────────────────────────────────
     uint64_t n_sa_samples = static_cast<uint64_t>(sa_len) / sample_step_ + 1;
@@ -405,7 +437,7 @@ void ReverseFMIndex::Build(const std::vector<int64_t>& forward_sa,
 }
 
 SAInterval ReverseFMIndex::BackwardSearch(const std::vector<uint8_t>& pattern) const {
-    if (bwt_.empty()) return {0, 0};
+    if (bwt_len_ == 0) return {0, 0};
 
     uint64_t lo = 0;
     uint64_t hi = bwt_len_;
@@ -427,7 +459,7 @@ uint64_t ReverseFMIndex::Locate(uint64_t row) const {
     uint64_t r = row;
     while (r % sample_step_ != 0 && r != sentinel_row_) {
         // LF mapping for reverse index
-        uint8_t c = bwt_[r];
+        uint8_t c = occ_.BwtAt(r);  // v1.1: access via wavelet tree
         r = C_[c] + occ_.RankBwt(c, r);
         ++steps;
         if (steps > bwt_len_) return s_len_;  // safety
@@ -443,14 +475,22 @@ void ReverseFMIndex::LoadFromStored(const std::vector<uint8_t>& full_bwt,
                                      uint64_t sentinel_row,
                                      uint64_t sample_step,
                                      uint64_t s_len) {
-    bwt_ = full_bwt;
+    // v1.1: BWT not stored separately; lives in wavelet tree.
     bwt_len_ = full_bwt.size();
     sentinel_row_ = sentinel_row;
     sample_step_ = sample_step;
     s_len_ = s_len;
     C_ = c_array;
     sa_samples_ = sa_samples;
-    occ_.Build(bwt_, SIGMA_EXT);
+
+    // Deserialize wavelet tree from stored Occ data
+    if (!occ_data.empty()) {
+        occ_.Deserialize(occ_data.data(), occ_data.size());
+    }
+    if (occ_.BwtLen() != bwt_len_) {
+        // Fallback: rebuild from full_bwt
+        occ_.Build(full_bwt, SIGMA_EXT);
+    }
 }
 
 }  // namespace bamsix
